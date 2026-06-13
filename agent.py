@@ -10,7 +10,6 @@ import logging
 from datetime import datetime
 import httpx
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -21,29 +20,24 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Конфигурация ────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]   # твой личный chat_id
-TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")  # опционально
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 
 SEARCH_QUERIES = [
     "полиция МВД России новости сегодня",
     "сотрудники полиции происшествия",
     "правоохранительные органы задержание",
     "МВД полицейский подвиг награда",
-    "реформа полиции закон",
     "ГИБДД ДПС новости",
     "Росгвардия новости",
-    "следственный комитет новости",
 ]
 
 MODEL = "claude-sonnet-4-6"
-# ────────────────────────────────────────────────────────────────────────────
 
 
 async def search_news(query: str, client: httpx.AsyncClient) -> list[dict]:
-    """Поиск новостей через Tavily API (или fallback на DuckDuckGo RSS)."""
     if TAVILY_API_KEY:
         return await _tavily_search(query, client)
     return await _ddg_search(query, client)
@@ -57,8 +51,8 @@ async def _tavily_search(query: str, client: httpx.AsyncClient) -> list[dict]:
                 "api_key": TAVILY_API_KEY,
                 "query": query,
                 "search_depth": "basic",
-                "max_results": 5,
-                "include_images": True,
+                "max_results": 3,
+                "include_images": False,
                 "days": 1,
             },
             timeout=15,
@@ -67,11 +61,9 @@ async def _tavily_search(query: str, client: httpx.AsyncClient) -> list[dict]:
         results = []
         for r in data.get("results", []):
             results.append({
-                "title": r.get("title", ""),
+                "title": r.get("title", "")[:200],
                 "url": r.get("url", ""),
-                "snippet": r.get("content", ""),
-                "image": (data.get("images") or [None])[0],
-                "published": r.get("published_date", ""),
+                "snippet": r.get("content", "")[:300],
                 "source": r.get("url", "").split("/")[2] if r.get("url") else "",
             })
         return results
@@ -81,11 +73,10 @@ async def _tavily_search(query: str, client: httpx.AsyncClient) -> list[dict]:
 
 
 async def _ddg_search(query: str, client: httpx.AsyncClient) -> list[dict]:
-    """Fallback: DuckDuckGo HTML поиск (без API-ключа)."""
     try:
         resp = await client.get(
             "https://html.duckduckgo.com/html/",
-            params={"q": query, "df": "d"},  # df=d → за сутки
+            params={"q": query, "df": "d"},
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=15,
             follow_redirects=True,
@@ -104,12 +95,10 @@ async def _ddg_search(query: str, client: httpx.AsyncClient) -> list[dict]:
                 if tag == "a" and "result__a" in attrs.get("class", ""):
                     self._current["url"] = attrs.get("href", "")
                     self._in_title = True
-                if tag == "a" and "result__snippet" in attrs.get("class", ""):
-                    self._in_title = False
 
             def handle_data(self, data):
                 if self._in_title and data.strip():
-                    self._current["title"] = data.strip()
+                    self._current["title"] = data.strip()[:200]
                     self._in_title = False
                     if self._current.get("url"):
                         self.results.append(dict(self._current))
@@ -122,73 +111,37 @@ async def _ddg_search(query: str, client: httpx.AsyncClient) -> list[dict]:
                 "title": r["title"],
                 "url": r["url"],
                 "snippet": "",
-                "image": None,
-                "published": "",
                 "source": r["url"].split("/")[2] if r["url"] else "",
             }
-            for r in parser.results[:5]
+            for r in parser.results[:3]
         ]
     except Exception as e:
         log.warning(f"DDG search error: {e}")
         return []
 
 
-async def analyze_and_format(raw_articles: list[dict], client: httpx.AsyncClient) -> dict:
-    """
-    Передаём сырые статьи в Claude.
-    Получаем: дайджест + готовый пост для ВКонтакте.
-    """
+async def analyze_news(articles: list[dict], client: httpx.AsyncClient) -> list[dict]:
+    """Фильтрация и оценка релевантности через Claude."""
+    if not articles:
+        return []
+
+    # Берём максимум 15 статей чтобы не перегружать контекст
+    articles = articles[:15]
     today = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-    articles_text = json.dumps(raw_articles, ensure_ascii=False, indent=2)
+    articles_text = "\n".join([
+        f"{i+1}. {a['title']} | {a['source']} | {a['url']}"
+        for i, a in enumerate(articles)
+    ])
 
-    system_prompt = """Ты — редактор профессионального сообщества полицейских (110 000 подписчиков ВКонтакте).
-Твоя задача — анализировать новости и готовить контент.
-Отвечай ТОЛЬКО валидным JSON без markdown-обёртки."""
-
-    user_prompt = f"""Сегодня: {today}
-
-Вот собранные новости (могут быть дубли и нерелевантные):
+    prompt = f"""Дата: {today}
+Список новостей (заголовок | источник | ссылка):
 {articles_text}
 
-Выполни три задачи:
-
-1. ФИЛЬТРАЦИЯ: оставь только новости, реально связанные с полицией, МВД, ГИБДД, Росгвардией, СК, правоохранительными органами России. Убери дубли.
-
-2. ДАЙДЖЕСТ для редактора (краткий, деловой):
-   - Список топ-5 новостей с оценкой важности (🔴 высокая / 🟡 средняя / 🟢 низкая)
-   - Для каждой: заголовок, 1-2 предложения сути, источник, ссылка
-
-3. ГОТОВЫЙ ПОСТ для ВКонтакте (для аудитории — действующих и бывших сотрудников полиции):
-   - Заголовок с эмодзи
-   - Основной текст (живой, профессиональный тон, без казённости)
-   - Блок ссылок на источники
-   - Хэштеги (#полиция #МВД #правоохранители и т.п.)
-   - Если есть фото — укажи ссылку на изображение в поле image_url
-
-Верни JSON строго в таком формате:
-{{
-  "digest": {{
-    "date": "{today}",
-    "total_found": <число>,
-    "relevant_count": <число>,
-    "items": [
-      {{
-        "priority": "🔴|🟡|🟢",
-        "title": "...",
-        "summary": "...",
-        "source": "...",
-        "url": "...",
-        "image_url": null
-      }}
-    ]
-  }},
-  "vk_post": {{
-    "text": "полный текст поста",
-    "image_url": "url фото или null",
-    "hashtags": "#полиция #МВД ..."
-  }}
-}}"""
+Отбери только новости про полицию, МВД, ГИБДД, Росгвардию, СК, правоохранительные органы России.
+Верни JSON массив (без markdown, только JSON):
+[{{"title":"...","url":"...","source":"...","priority":"high|medium|low","summary":"1-2 предложения на русском"}}]
+Если релевантных нет — верни пустой массив []"""
 
     resp = await client.post(
         "https://api.anthropic.com/v1/messages",
@@ -199,123 +152,163 @@ async def analyze_and_format(raw_articles: list[dict], client: httpx.AsyncClient
         },
         json={
             "model": MODEL,
-            "max_tokens": 3000,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": user_prompt}],
+            "max_tokens": 1500,
+            "messages": [{"role": "user", "content": prompt}],
         },
         timeout=60,
     )
 
-    raw = resp.json()["content"][0]["text"]
-    # Убираем возможные ```json обёртки
-    raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-    return json.loads(raw)
+    raw = resp.json()["content"][0]["text"].strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
+
+    # Находим JSON массив в ответе
+    start = raw.find("[")
+    end = raw.rfind("]") + 1
+    if start == -1 or end == 0:
+        return []
+
+    return json.loads(raw[start:end])
 
 
-def format_digest_message(digest: dict) -> str:
-    """Форматируем дайджест для Telegram."""
-    lines = [
-        f"📋 *ДАЙДЖЕСТ НОВОСТЕЙ* — {digest['date']}",
-        f"Найдено: {digest['total_found']} | Релевантных: {digest['relevant_count']}",
-        "─" * 30,
-    ]
-    for i, item in enumerate(digest["items"], 1):
-        lines.append(
-            f"{item['priority']} *{i}. {item['title']}*\n"
-            f"{item['summary']}\n"
-            f"📰 {item['source']}\n"
-            f"🔗 {item['url']}"
-        )
-        if item.get("image_url"):
-            lines.append(f"🖼 {item['image_url']}")
-        lines.append("")
-    return "\n".join(lines)
+async def format_vk_post(items: list[dict], client: httpx.AsyncClient) -> str:
+    """Генерируем готовый пост для ВКонтакте."""
+    if not items:
+        return ""
+
+    top = items[:3]
+    news_text = "\n".join([
+        f"- {it['title']} ({it['source']})"
+        for it in top
+    ])
+
+    prompt = f"""Напиши пост для ВКонтакте для профессионального сообщества полицейских (110 тыс подписчиков).
+
+Новости для поста:
+{news_text}
+
+Требования:
+- Живой профессиональный тон, без казённости
+- Эмодзи в заголовке
+- 3-5 предложений основного текста
+- Ссылки на источники в конце
+- Хэштеги: #полиция #МВД #правоохранители
+
+Верни только текст поста, без пояснений."""
+
+    resp = await client.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": MODEL,
+            "max_tokens": 800,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=30,
+    )
+
+    return resp.json()["content"][0]["text"].strip()
 
 
-def format_vk_message(vk_post: dict) -> str:
-    """Форматируем готовый VK-пост для Telegram."""
-    lines = [
-        "📢 *ГОТОВЫЙ ПОСТ ДЛЯ ВКОНТАКТЕ*",
-        "─" * 30,
-        vk_post["text"],
-        "",
-        vk_post["hashtags"],
-    ]
-    if vk_post.get("image_url"):
-        lines.append(f"\n🖼 Фото: {vk_post['image_url']}")
-    return "\n".join(lines)
-
-
-async def send_telegram(text: str, bot_token: str, chat_id: str, client: httpx.AsyncClient):
-    """Отправка сообщения в Telegram (с разбивкой если > 4096 символов)."""
+async def send_telegram(text: str, client: httpx.AsyncClient):
+    """Отправка в Telegram с разбивкой на части."""
     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
     for chunk in chunks:
-        await client.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": chunk,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": False,
-            },
-            timeout=15,
-        )
+        try:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": chunk,
+                    "parse_mode": "Markdown",
+                    "disable_web_page_preview": True,
+                },
+                timeout=15,
+            )
+        except Exception as e:
+            log.error(f"Telegram send error: {e}")
         await asyncio.sleep(0.5)
 
 
+def priority_emoji(p: str) -> str:
+    return {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(p, "⚪")
+
+
 async def run_once():
-    """Один цикл: поиск → анализ → отправка."""
     log.info("▶ Запуск цикла мониторинга")
     async with httpx.AsyncClient() as client:
-        # 1. Сбор новостей по всем запросам
+        # 1. Сбор новостей
         all_articles = []
         for query in SEARCH_QUERIES:
             articles = await search_news(query, client)
             all_articles.extend(articles)
             log.info(f"  '{query}' → {len(articles)} результатов")
-            await asyncio.sleep(1)  # небольшая пауза между запросами
+            await asyncio.sleep(1)
 
-        if not all_articles:
-            log.warning("Новостей не найдено, пропускаем цикл")
+        # Убираем дубли по URL
+        seen = set()
+        unique = []
+        for a in all_articles:
+            if a["url"] not in seen:
+                seen.add(a["url"])
+                unique.append(a)
+
+        log.info(f"Уникальных статей: {len(unique)}")
+
+        if not unique:
+            log.warning("Новостей не найдено")
             return
 
-        log.info(f"Всего собрано: {len(all_articles)} статей")
-
         # 2. Анализ через Claude
-        result = await analyze_and_format(all_articles, client)
-        log.info(f"Claude обработал: {result['digest']['relevant_count']} релевантных новостей")
+        items = await analyze_news(unique, client)
+        log.info(f"Релевантных новостей: {len(items)}")
 
-        # 3. Отправка в Telegram
-        digest_msg = format_digest_message(result["digest"])
-        vk_msg = format_vk_message(result["vk_post"])
+        if not items:
+            log.info("Нет релевантных новостей, пропускаем")
+            return
 
-        await send_telegram(digest_msg, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, client)
+        # 3. Формируем дайджест
+        today = datetime.now().strftime("%d.%m.%Y %H:%M")
+        digest_lines = [f"📋 *ДАЙДЖЕСТ* — {today}\n"]
+        for i, item in enumerate(items, 1):
+            emoji = priority_emoji(item.get("priority", "low"))
+            digest_lines.append(
+                f"{emoji} *{i}. {item['title']}*\n"
+                f"{item.get('summary', '')}\n"
+                f"📰 {item.get('source', '')} | {item.get('url', '')}\n"
+            )
+        digest = "\n".join(digest_lines)
+
+        # 4. Генерируем VK пост
+        vk_post = await format_vk_post(items, client)
+
+        # 5. Отправляем в Telegram
+        await send_telegram(digest, client)
         await asyncio.sleep(1)
-        await send_telegram(vk_msg, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, client)
+        if vk_post:
+            await send_telegram(f"📢 *ГОТОВЫЙ ПОСТ ДЛЯ ВКОНТАКТЕ*\n{'─'*20}\n{vk_post}", client)
 
-        log.info("✅ Дайджест и пост отправлены в Telegram")
+        log.info("✅ Отправлено в Telegram")
 
 
 async def main():
-    """Основной цикл: запуск каждый час."""
     log.info("🚀 Агент мониторинга новостей запущен")
     while True:
         try:
             await run_once()
         except Exception as e:
-            log.error(f"Ошибка в цикле: {e}", exc_info=True)
-            # Уведомление об ошибке в Telegram
+            log.error(f"Ошибка: {e}", exc_info=True)
             try:
                 async with httpx.AsyncClient() as client:
-                    await send_telegram(
-                        f"⚠️ Ошибка агента:\n`{e}`",
-                        TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, client
-                    )
+                    await send_telegram(f"⚠️ Ошибка агента:\n`{e}`", client)
             except Exception:
                 pass
 
         log.info("⏳ Следующий запуск через 1 час")
-        await asyncio.sleep(3600)  # 1 час
+        await asyncio.sleep(3600)
 
 
 if __name__ == "__main__":

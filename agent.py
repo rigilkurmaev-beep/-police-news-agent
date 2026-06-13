@@ -1,6 +1,6 @@
 """
 Агент мониторинга новостей для полицейского сообщества
-Запускается каждый час, ищет новости, форматирует и отправляет в Telegram
+Запускается каждый час, ищет новости и отправляет дайджест в Telegram
 """
 
 import os
@@ -121,11 +121,9 @@ async def _ddg_search(query: str, client: httpx.AsyncClient) -> list[dict]:
 
 
 async def analyze_news(articles: list[dict], client: httpx.AsyncClient) -> list[dict]:
-    """Фильтрация и оценка релевантности через Claude."""
     if not articles:
         return []
 
-    # Берём максимум 15 статей чтобы не перегружать контекст
     articles = articles[:15]
     today = datetime.now().strftime("%d.%m.%Y %H:%M")
 
@@ -161,7 +159,6 @@ async def analyze_news(articles: list[dict], client: httpx.AsyncClient) -> list[
     raw = resp.json()["content"][0]["text"].strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
 
-    # Находим JSON массив в ответе
     start = raw.find("[")
     end = raw.rfind("]") + 1
     if start == -1 or end == 0:
@@ -170,51 +167,7 @@ async def analyze_news(articles: list[dict], client: httpx.AsyncClient) -> list[
     return json.loads(raw[start:end])
 
 
-async def format_vk_post(items: list[dict], client: httpx.AsyncClient) -> str:
-    """Генерируем готовый пост для ВКонтакте."""
-    if not items:
-        return ""
-
-    top = items[:3]
-    news_text = "\n".join([
-        f"- {it['title']} ({it['source']})"
-        for it in top
-    ])
-
-    prompt = f"""Напиши пост для ВКонтакте для профессионального сообщества полицейских (110 тыс подписчиков).
-
-Новости для поста:
-{news_text}
-
-Требования:
-- Живой профессиональный тон, без казённости
-- Эмодзи в заголовке
-- 3-5 предложений основного текста
-- Ссылки на источники в конце
-- Хэштеги: #полиция #МВД #правоохранители
-
-Верни только текст поста, без пояснений."""
-
-    resp = await client.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": MODEL,
-            "max_tokens": 800,
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        timeout=30,
-    )
-
-    return resp.json()["content"][0]["text"].strip()
-
-
 async def send_telegram(text: str, client: httpx.AsyncClient):
-    """Отправка в Telegram с разбивкой на части."""
     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
     for chunk in chunks:
         try:
@@ -270,7 +223,7 @@ async def run_once():
             log.info("Нет релевантных новостей, пропускаем")
             return
 
-        # 3. Формируем дайджест
+        # 3. Формируем и отправляем только дайджест
         today = datetime.now().strftime("%d.%m.%Y %H:%M")
         digest_lines = [f"📋 *ДАЙДЖЕСТ* — {today}\n"]
         for i, item in enumerate(items, 1):
@@ -282,16 +235,8 @@ async def run_once():
             )
         digest = "\n".join(digest_lines)
 
-        # 4. Генерируем VK пост
-        vk_post = await format_vk_post(items, client)
-
-        # 5. Отправляем в Telegram
         await send_telegram(digest, client)
-        await asyncio.sleep(1)
-        if vk_post:
-            await send_telegram(f"📢 *ГОТОВЫЙ ПОСТ ДЛЯ ВКОНТАКТЕ*\n{'─'*20}\n{vk_post}", client)
-
-        log.info("✅ Отправлено в Telegram")
+        log.info("✅ Дайджест отправлен в Telegram")
 
 
 async def main():

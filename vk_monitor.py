@@ -98,7 +98,8 @@ async def get_community_posts(community: str, client: httpx.AsyncClient) -> list
                 continue
 
             post_id = f"{community}_{post['id']}"
-            post_url = f"https://vk.com/{community}?w=wall-{abs(post['owner_id'])}_{post['id']}"
+            owner_id = post['owner_id']
+            post_url = f"https://vk.com/{community}?w=wall{owner_id}_{post['id']}"
 
             posts.append({
                 "id": post_id,

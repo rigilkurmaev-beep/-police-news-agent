@@ -1,5 +1,6 @@
 """
 Агент мониторинга новостей для полицейского сообщества "Записки полицейского"
+С памятью — не присылает одинаковые новости повторно
 """
 
 import os
@@ -7,6 +8,7 @@ import json
 import asyncio
 import logging
 from datetime import datetime, timedelta
+from pathlib import Path
 import httpx
 
 logging.basicConfig(
@@ -25,14 +27,49 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 
 MODEL = "claude-sonnet-4-6"
+MEMORY_FILE = Path("/data/sent_news.json")  # Railway Volume
+MEMORY_TTL_HOURS = 72  # помним новости 72 часа
+
+# Слова-маркеры обновления — присылаем даже если похожая новость была
+UPDATE_MARKERS = [
+    "подробности", "стало известно", "обновление", "приговор",
+    "осуждён", "вынесен приговор", "арестован", "задержан повторно",
+    "новые детали", "выяснилось", "установлено"
+]
+
+
+def load_memory() -> dict:
+    """Загружаем память об отправленных новостях."""
+    try:
+        MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if MEMORY_FILE.exists():
+            data = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+            # Очищаем устаревшие записи
+            cutoff = (datetime.now() - timedelta(hours=MEMORY_TTL_HOURS)).isoformat()
+            data = {k: v for k, v in data.items() if v.get("sent_at", "") > cutoff}
+            return data
+    except Exception as e:
+        log.warning(f"Ошибка загрузки памяти: {e}")
+    return {}
+
+
+def save_memory(memory: dict):
+    """Сохраняем память."""
+    try:
+        MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        MEMORY_FILE.write_text(json.dumps(memory, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.warning(f"Ошибка сохранения памяти: {e}")
+
+
+def is_update_news(title: str) -> bool:
+    """Проверяем — это обновление уже известной истории?"""
+    title_lower = title.lower()
+    return any(marker in title_lower for marker in UPDATE_MARKERS)
 
 
 def get_search_queries():
-    """Запросы с текущим месяцем и годом для свежих новостей."""
     now = datetime.now()
-    date_suffix = f"{now.strftime('%B')} {now.year}"  # например "июнь 2026"
-    month_year = f"{now.month}/{now.year}"
-
     return [
         f"напали избили полицейского сотрудника МВД {now.year}",
         f"напали на сотрудника Росгвардии {now.year}",
@@ -70,7 +107,7 @@ FILTER_PROMPT = """Ты — редактор профессионального 
 - Только если сам сотрудник — герой события
 
 ❌ НЕ БРАТЬ:
-- Новости старше 48 часов — СТРОГО
+- Новости старше 48 часов
 - ДТП где полиция просто приехала
 - Розыск преступников (стандартная работа)
 - Статистика и плановые отчёты
@@ -98,7 +135,7 @@ async def _tavily_search(query: str, client: httpx.AsyncClient) -> list[dict]:
                 "search_depth": "basic",
                 "max_results": 3,
                 "include_images": False,
-                "days": 2,  # только за последние 2 дня
+                "days": 2,
             },
             timeout=15,
         )
@@ -119,11 +156,10 @@ async def _tavily_search(query: str, client: httpx.AsyncClient) -> list[dict]:
 
 
 async def _ddg_search(query: str, client: httpx.AsyncClient) -> list[dict]:
-    """DuckDuckGo с фильтром за последние сутки (df=d)."""
     try:
         resp = await client.get(
             "https://html.duckduckgo.com/html/",
-            params={"q": query, "df": "d"},  # d = последние сутки
+            params={"q": query, "df": "d"},
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=15,
             follow_redirects=True,
@@ -168,6 +204,100 @@ async def _ddg_search(query: str, client: httpx.AsyncClient) -> list[dict]:
         return []
 
 
+async def filter_duplicates(items: list[dict], memory: dict, client: httpx.AsyncClient) -> list[dict]:
+    """
+    Убираем дубли используя Claude для сравнения смысла заголовков.
+    Если новость — обновление известной истории, пропускаем через.
+    """
+    if not items or not memory:
+        return items
+
+    sent_titles = [v["title"] for v in memory.values()]
+    if not sent_titles:
+        return items
+
+    # Проверяем каждую новость против памяти
+    new_items = []
+    for item in items:
+        url = item.get("url", "")
+        title = item.get("title", "")
+
+        # Если URL уже был — это обновление той же статьи
+        if url in memory:
+            if is_update_news(title):
+                log.info(f"Обновление известной новости: {title[:60]}")
+                item["is_update"] = True
+                new_items.append(item)
+            else:
+                log.info(f"Пропускаем дубль (тот же URL): {title[:60]}")
+            continue
+
+        new_items.append(item)
+
+    if not new_items:
+        return []
+
+    # Claude проверяет смысловые дубли (одно событие с разных сайтов)
+    sent_sample = sent_titles[-20:]  # последние 20 отправленных
+    candidates_text = "\n".join([f"{i+1}. {it['title']}" for i, it in enumerate(new_items)])
+    sent_text = "\n".join([f"- {t}" for t in sent_sample])
+
+    prompt = f"""Уже отправленные новости за последние 72 часа:
+{sent_text}
+
+Новые кандидаты:
+{candidates_text}
+
+Для каждого кандидата определи:
+- "new" — это новое событие, не похожее на уже отправленные
+- "duplicate" — это то же событие что уже было (другой источник/пересказ)
+- "update" — это обновление/продолжение уже известного события (новые детали, приговор и т.п.)
+
+Верни JSON (только JSON):
+[{{"index": 1, "status": "new|duplicate|update"}}]"""
+
+    try:
+        resp = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": MODEL,
+                "max_tokens": 500,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
+        )
+
+        raw = resp.json()["content"][0]["text"].strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        start = raw.find("[")
+        end = raw.rfind("]") + 1
+        if start == -1 or end == 0:
+            return new_items
+
+        statuses = json.loads(raw[start:end])
+        result = []
+        for s in statuses:
+            idx = s.get("index", 0) - 1
+            status = s.get("status", "new")
+            if 0 <= idx < len(new_items):
+                if status == "duplicate":
+                    log.info(f"Пропускаем смысловой дубль: {new_items[idx]['title'][:60]}")
+                else:
+                    if status == "update":
+                        new_items[idx]["is_update"] = True
+                    result.append(new_items[idx])
+        return result
+
+    except Exception as e:
+        log.warning(f"Ошибка проверки дублей: {e}")
+        return new_items
+
+
 async def analyze_news(articles: list[dict], client: httpx.AsyncClient) -> list[dict]:
     if not articles:
         return []
@@ -178,7 +308,7 @@ async def analyze_news(articles: list[dict], client: httpx.AsyncClient) -> list[
     cutoff = (now - timedelta(hours=48)).strftime("%d.%m.%Y")
 
     articles_text = "\n".join([
-        f"{i+1}. {a['title']} | {a.get('published', 'дата неизвестна')} | {a['source']} | {a['url']}"
+        f"{i+1}. {a['title']} | {a.get('published', '')} | {a['source']} | {a['url']}"
         for i, a in enumerate(articles)
     ])
 
@@ -187,13 +317,13 @@ async def analyze_news(articles: list[dict], client: httpx.AsyncClient) -> list[
 Сейчас: {today}
 Отсекай всё старше {cutoff}.
 
-Новости для оценки:
+Новости:
 {articles_text}
 
-Верни JSON массив (только JSON, без markdown):
-[{{"title":"...","url":"...","source":"...","priority":"high|medium|low","summary":"1-2 предложения — суть события на русском"}}]
+Верни JSON (только JSON, без markdown):
+[{{"title":"...","url":"...","source":"...","priority":"high|medium|low","summary":"1-2 предложения на русском"}}]
 
-Если ни одна не подходит или все старые — верни []"""
+Если ничего не подходит — верни []"""
 
     resp = await client.post(
         "https://api.anthropic.com/v1/messages",
@@ -212,7 +342,6 @@ async def analyze_news(articles: list[dict], client: httpx.AsyncClient) -> list[
 
     raw = resp.json()["content"][0]["text"].strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
-
     start = raw.find("[")
     end = raw.rfind("]") + 1
     if start == -1 or end == 0:
@@ -246,7 +375,13 @@ def priority_emoji(p: str) -> str:
 
 async def run_once():
     log.info("▶ Запуск цикла мониторинга")
+
+    # Загружаем память
+    memory = load_memory()
+    log.info(f"В памяти {len(memory)} новостей за последние 72ч")
+
     async with httpx.AsyncClient() as client:
+        # 1. Сбор новостей
         queries = get_search_queries()
         all_articles = []
         for query in queries:
@@ -255,7 +390,7 @@ async def run_once():
             log.info(f"  '{query[:50]}' → {len(articles)} результатов")
             await asyncio.sleep(1)
 
-        # Убираем дубли по URL
+        # Убираем дубли по URL в текущей выборке
         seen = set()
         unique = []
         for a in all_articles:
@@ -269,30 +404,52 @@ async def run_once():
             log.warning("Новостей не найдено")
             return
 
+        # 2. Фильтр релевантности через Claude
         items = await analyze_news(unique, client)
-        log.info(f"Релевантных свежих новостей: {len(items)}")
+        log.info(f"Релевантных: {len(items)}")
 
         if not items:
-            log.info("Нет свежих релевантных новостей в этом цикле")
+            log.info("Нет релевантных новостей")
             return
 
-        # Сортируем по приоритету
-        priority_order = {"high": 0, "medium": 1, "low": 2}
-        items.sort(key=lambda x: priority_order.get(x.get("priority", "low"), 2))
+        # 3. Убираем уже отправленные (с умным определением дублей)
+        fresh_items = await filter_duplicates(items, memory, client)
+        log.info(f"Новых (не дублей): {len(fresh_items)}")
 
+        if not fresh_items:
+            log.info("Все новости уже отправлялись ранее")
+            return
+
+        # 4. Сортируем по приоритету
+        priority_order = {"high": 0, "medium": 1, "low": 2}
+        fresh_items.sort(key=lambda x: priority_order.get(x.get("priority", "low"), 2))
+
+        # 5. Формируем дайджест
         today = datetime.now().strftime("%d.%m.%Y %H:%M")
         digest_lines = [f"📋 *ЗАПИСКИ ПОЛИЦЕЙСКОГО* — {today}\n"]
-        for i, item in enumerate(items, 1):
+        for i, item in enumerate(fresh_items, 1):
             emoji = priority_emoji(item.get("priority", "low"))
+            update_mark = " 🔄" if item.get("is_update") else ""
             digest_lines.append(
-                f"{emoji} *{i}. {item['title']}*\n"
+                f"{emoji} *{i}. {item['title']}*{update_mark}\n"
                 f"{item.get('summary', '')}\n"
                 f"📰 {item.get('source', '')} | {item.get('url', '')}\n"
             )
         digest = "\n".join(digest_lines)
 
+        # 6. Отправляем
         await send_telegram(digest, client)
-        log.info("✅ Дайджест отправлен в Telegram")
+
+        # 7. Сохраняем в память
+        now_iso = datetime.now().isoformat()
+        for item in fresh_items:
+            memory[item["url"]] = {
+                "title": item["title"],
+                "sent_at": now_iso,
+            }
+        save_memory(memory)
+
+        log.info(f"✅ Отправлено {len(fresh_items)} новостей, память обновлена")
 
 
 async def main():

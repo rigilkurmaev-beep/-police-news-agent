@@ -205,7 +205,6 @@ async def send_telegram(text: str, client: httpx.AsyncClient):
                 json={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "text": chunk,
-                    "parse_mode": "Markdown",
                     "disable_web_page_preview": True,
                 },
                 timeout=15,
@@ -256,11 +255,11 @@ async def run_once():
         items.sort(key=lambda x: priority_order.get(x.get("priority", "low"), 2))
 
         today = datetime.now().strftime("%d.%m.%Y %H:%M")
-        digest_lines = [f"📱 *ДАЙДЖЕСТ ВКОНТАКТЕ* — {today}\n"]
+        digest_lines = [f"📱 ДАЙДЖЕСТ ВКОНТАКТЕ — {today}\n"]
         for i, item in enumerate(items, 1):
             emoji = priority_emoji(item.get("priority", "low"))
             digest_lines.append(
-                f"{emoji} *{i}. [{item['community']}]* {item['date']}\n"
+                f"{emoji} {i}. [{item['community']}] {item['date']}\n"
                 f"{item.get('summary', '')}\n"
                 f"🔗 {item.get('url', '')}\n"
             )

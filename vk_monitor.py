@@ -92,9 +92,10 @@ async def get_community_posts(community: str, client: httpx.AsyncClient) -> list
             if not text:
                 continue
 
-            owner_id = post['owner_id']
-            post_url = f"https://vk.com/{community}?w=wall{owner_id}_{post['id']}"
-            post_id = f"{community}_{post['id']}"
+            owner_id = int(post['owner_id'])
+            pid = int(post['id'])
+            post_url = f"https://vk.com/{community}?w=wall{owner_id}_{pid}"
+            post_id = f"{community}_{pid}"
 
             posts.append({
                 "id": post_id,

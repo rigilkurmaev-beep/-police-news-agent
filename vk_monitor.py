@@ -1,6 +1,5 @@
 """
 Агент мониторинга сообществ ВКонтакте для "Записки полицейского"
-Читает посты из указанных сообществ и присылает дайджест в Telegram
 """
 
 import os
@@ -30,7 +29,6 @@ MODEL = "claude-sonnet-4-6"
 MEMORY_FILE = Path("/data/vk_sent_posts.json")
 MEMORY_TTL_HOURS = 72
 
-# Список сообществ для мониторинга
 VK_COMMUNITIES = [
     "ombudsment",
     "typic_police",
@@ -63,7 +61,6 @@ def save_memory(memory: dict):
 
 
 async def get_community_posts(community: str, client: httpx.AsyncClient) -> list[dict]:
-    """Получаем последние посты из сообщества через VK API."""
     try:
         resp = await client.get(
             f"{VK_API}/wall.get",
@@ -86,25 +83,23 @@ async def get_community_posts(community: str, client: httpx.AsyncClient) -> list
         cutoff_ts = int((datetime.now() - timedelta(hours=24)).timestamp())
 
         for post in data.get("response", {}).get("items", []):
-            # Только свежие посты за последние 24 часа
             if post.get("date", 0) < cutoff_ts:
                 continue
-            # Пропускаем репосты
             if "copy_history" in post:
                 continue
 
             text = post.get("text", "").strip()
-            if not text or len(text) < 30:
+            if not text:
                 continue
 
-            post_id = f"{community}_{post['id']}"
             owner_id = post['owner_id']
             post_url = f"https://vk.com/{community}?w=wall{owner_id}_{post['id']}"
+            post_id = f"{community}_{post['id']}"
 
             posts.append({
                 "id": post_id,
                 "url": post_url,
-                "text": text[:500],
+                "text": text[:1000],
                 "date": datetime.fromtimestamp(post["date"]).strftime("%d.%m.%Y %H:%M"),
                 "community": community,
             })
@@ -117,53 +112,53 @@ async def get_community_posts(community: str, client: httpx.AsyncClient) -> list
         return []
 
 
-FILTER_PROMPT = """Ты — редактор профессионального сообщества "Записки полицейского" (110 000 подписчиков ВКонтакте). Аудитория — действующие и бывшие сотрудники МВД, полиции, Росгвардии.
+FILTER_PROMPT = """Ты — редактор профессионального сообщества "Записки полицейского" (110 000 подписчиков).
 
-ГЛАВНЫЙ ПРИНЦИП: берём только посты где сотрудник или ведомство — ГЛАВНЫЙ ГЕРОЙ события.
+Тебе присылают посты из тематических полицейских сообществ ВКонтакте. Твоя задача — отсеять только явно нерелевантное и пропустить всё интересное.
 
-✅ БРАТЬ:
-- Нападения на сотрудников (избили, нож, таран машины)
-- Коррупция и преступления сотрудников (взятка, крышевание, задержан начальник)
-- Героизм любого масштаба (помог человеку, спас, сопроводил в больницу)
-- Погони и резонансные задержания
-- Вирусные истории про сотрудников
-- Суды и приговоры сотрудникам
-- ДТП где сотрудник виновник
-- Кадровые события (некомплект, назначения, реформы, зарплаты)
-- Награды сотрудников
-- Зарубежный опыт полиции
+✅ ПРОПУСКАТЬ (почти всё что связано с полицией и правоохранителями):
+- Любые новости и события с участием полицейских, сотрудников МВД, ГАИ, ДПС, Росгвардии, СК, ФСБ
+- Коррупция, преступления, суды над сотрудниками
+- Героизм, подвиги, награды
+- Погони, задержания, операции
+- Зарубежный опыт полиции (США, Европа, другие страны) — интересно читателям
+- Исторические материалы про известных сотрудников (например дело Евсюкова)
+- Курьёзные и вирусные истории с участием полиции
+- Кадровые новости, реформы, законы
+- Аналитика и расследования про МВД и правоохранителей
 
-❌ НЕ БРАТЬ:
-- Стандартная работа полиции (приехали на вызов, раскрыли преступление)
-- Плановая статистика и отчёты
-- Посты где полиция упомянута вскользь
-- Общие новости без конкретного события
+❌ ОТКЛОНЯТЬ только явно нерелевантное:
+- Реклама и коммерческие предложения
+- Поздравления с праздниками без новостного содержания
+- Посты совсем не про полицию и правоохранителей
+- Технические объявления сообщества
+
+ВАЖНО: Эти сообщества специализируются на полицейской тематике — доверяй их отбору. Если пост хоть как-то связан с полицией/правоохранителями — пропускай.
 
 ПРИОРИТЕТЫ:
-🔴 high — резонанс (нападение, коррупция начальника, подвиг, вирусное)
-🟡 medium — важное (погоня, суд, кадры, реформы)
-🟢 low — интересное (небольшая помощь, зарубежный опыт)"""
+🔴 high — резонанс (коррупция начальника, нападение, громкий приговор, вирусное)
+🟡 medium — важное событие (погоня, задержание, кадры, реформы)
+🟢 low — интересное (зарубежный опыт, история, курьёз)"""
 
 
 async def analyze_posts(posts: list[dict], client: httpx.AsyncClient) -> list[dict]:
-    """Фильтруем посты через Claude."""
     if not posts:
         return []
 
     posts_text = "\n\n".join([
-        f"[{i+1}] {p['community']} | {p['date']}\n{p['text'][:300]}"
+        f"[{i+1}] {p['community']} | {p['date']}\n{p['text']}"
         for i, p in enumerate(posts)
     ])
 
     prompt = f"""{FILTER_PROMPT}
 
-Посты из ВКонтакте сообществ:
+Посты для оценки:
 {posts_text}
 
 Верни JSON массив (только JSON, без markdown):
-[{{"index": 1, "priority": "high|medium|low", "summary": "1-2 предложения — суть события на русском"}}]
+[{{"index": 1, "priority": "high|medium|low", "summary": "1-2 предложения — суть поста на русском"}}]
 
-Если ничего не подходит — верни []"""
+Если пост нерелевантен — не включай его. Если все релевантны — включай все."""
 
     resp = await client.post(
         "https://api.anthropic.com/v1/messages",
@@ -230,7 +225,6 @@ async def run_once():
     log.info(f"В памяти {len(memory)} постов за 72ч")
 
     async with httpx.AsyncClient() as client:
-        # 1. Собираем посты из всех сообществ
         all_posts = []
         for community in VK_COMMUNITIES:
             posts = await get_community_posts(community, client)
@@ -243,7 +237,6 @@ async def run_once():
             log.info("Нет свежих постов")
             return
 
-        # 2. Убираем уже отправленные
         new_posts = [p for p in all_posts if p["id"] not in memory]
         log.info(f"Новых постов (не в памяти): {len(new_posts)}")
 
@@ -251,7 +244,6 @@ async def run_once():
             log.info("Все посты уже отправлялись")
             return
 
-        # 3. Фильтруем через Claude
         items = await analyze_posts(new_posts, client)
         log.info(f"Релевантных: {len(items)}")
 
@@ -259,11 +251,9 @@ async def run_once():
             log.info("Нет релевантных постов")
             return
 
-        # 4. Сортируем по приоритету
         priority_order = {"high": 0, "medium": 1, "low": 2}
         items.sort(key=lambda x: priority_order.get(x.get("priority", "low"), 2))
 
-        # 5. Формируем дайджест
         today = datetime.now().strftime("%d.%m.%Y %H:%M")
         digest_lines = [f"📱 *ДАЙДЖЕСТ ВКОНТАКТЕ* — {today}\n"]
         for i, item in enumerate(items, 1):
@@ -277,7 +267,6 @@ async def run_once():
 
         await send_telegram(digest, client)
 
-        # 6. Сохраняем в память
         now_iso = datetime.now().isoformat()
         for item in items:
             memory[item["id"]] = {

@@ -202,6 +202,35 @@ async def _tavily_search(query: str, client: httpx.AsyncClient) -> list[dict]:
         return []
 
 
+async def _check_article_date(url: str, client: httpx.AsyncClient) -> str:
+    """Проверяем дату публикации статьи через мета-теги."""
+    try:
+        resp = await client.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+            follow_redirects=True,
+        )
+        html = resp.text[:5000]  # Читаем только начало страницы
+
+        # Ищем дату в мета-тегах
+        import re
+        patterns = [
+            r'published_time"[^>]*content="([^"]+)"',
+            r'article:published_time"[^>]*content="([^"]+)"',
+            r'"datePublished"\s*:\s*"([^"]+)"',
+            r'"publishedAt"\s*:\s*"([^"]+)"',
+            r'<meta[^>]*name="date"[^>]*content="([^"]+)"',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, html, re.IGNORECASE)
+            if match:
+                return match.group(1)[:10]  # Берём только дату YYYY-MM-DD
+    except Exception:
+        pass
+    return ""
+
+
 async def _ddg_search(query: str, client: httpx.AsyncClient) -> list[dict]:
     try:
         resp = await client.get(
@@ -236,16 +265,28 @@ async def _ddg_search(query: str, client: httpx.AsyncClient) -> list[dict]:
 
         parser = DDGParser()
         parser.feed(resp.text)
-        return [
-            {
+        raw_results = parser.results[:5]
+
+        # Проверяем дату каждой статьи
+        cutoff = (datetime.now() - timedelta(hours=48)).strftime("%Y-%m-%d")
+        results = []
+        for r in raw_results:
+            url = r.get("url", "")
+            if not url:
+                continue
+            pub_date = await _check_article_date(url, client)
+            if pub_date and pub_date < cutoff:
+                log.info(f"  Пропускаем старую статью ({pub_date}): {r['title'][:50]}")
+                continue
+            results.append({
                 "title": r["title"],
-                "url": r["url"],
+                "url": url,
                 "snippet": "",
-                "source": r["url"].split("/")[2] if r["url"] else "",
-                "published": "",
-            }
-            for r in parser.results[:3]
-        ]
+                "source": url.split("/")[2] if url else "",
+                "published": pub_date,
+            })
+
+        return results[:3]
     except Exception as e:
         log.warning(f"DDG search error: {e}")
         return []

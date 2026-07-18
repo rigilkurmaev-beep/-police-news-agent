@@ -382,7 +382,7 @@ async def analyze_news(articles: list[dict], client: httpx.AsyncClient) -> list[
     if not articles:
         return []
 
-    articles = articles[:25]
+    articles = articles[:15]
     now = datetime.now()
     today = now.strftime("%d.%m.%Y %H:%M")
     cutoff = (now - timedelta(hours=48)).strftime("%d.%m.%Y")
@@ -420,7 +420,11 @@ async def analyze_news(articles: list[dict], client: httpx.AsyncClient) -> list[
         timeout=60,
     )
 
-    raw = resp.json()["content"][0]["text"].strip()
+    resp_data = resp.json()
+    if "error" in resp_data or "content" not in resp_data:
+        log.error(f"API error: {str(resp_data)[:200]}")
+        return []
+    raw = resp_data["content"][0]["text"].strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
     start = raw.find("[")
     end = raw.rfind("]") + 1
